@@ -1,0 +1,4 @@
+openai==2.32.0
+tavily-python==0.7.23
+requests
+pydantic
