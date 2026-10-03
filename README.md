@@ -1,120 +1,211 @@
 # Openings Researcher
 
-Researches chess openings using web search and produces structured coaching reports via OpenAI structured outputs.
+A replayable opening-research pipeline deployed to Databricks from GitHub.
+All Delta tables live in **`brikt.openings_research`** (catalog and schema are configurable).
+Agents produce candidates; the pipeline owns source snapshots, chess validation,
+publication, and run history. Games remain in the separate Lichess pipeline.
 
-## Setup
-
-```bash
-pip install openai tavily-python pydantic requests
-export OPENAI_API_KEY=...
-export TAVILY_API_KEY=...
+```text
+Tavily or saved sources -> collect -> extract -> validate -> publish
+                                      |            |          |
+                              replaceable agent  checks   Delta views
 ```
 
-## Usage
+## What works
 
-**Research all openings from a JSON list:**
-```bash
-python main.py --openings-file openings.json --data-dir ./data
+- Four serverless wheel tasks, with retries and durable stage markers.
+- Tavily searches across three topics, deduplicates URLs, and extracts up to six
+  documents. Raw responses (including extraction failures) are retained. The agent
+  sees up to 10,000 characters per document; the saved source version is that exact
+  excerpt, while the raw response retains the full returned text.
+- An OpenAI structured-output adapter (configurable model, default `gpt-4.1-mini`)
+  extracts move sequences, plans, pawn breaks, maneuvers, tactics and assessments.
+- A credential-free fixture adapter exercises the same contracts and tables.
+- Legal-move, FEN, source-reference and exact-excerpt validation. Rejected
+  candidates remain inspectable; prose semantics are **unreviewed**, not verified.
+- Re-extraction using another model against the exact same saved sources.
+- Stable chess entity IDs, idempotent merges, history per run, and current views
+  that select only completed publication batches.
+
+## Repository layout
+
+| Location | Purpose |
+| --- | --- |
+| `src/openings_research/contracts.py` | Versioned Pydantic input/output and position identity |
+| `agents.py` | Agent protocol, OpenAI adapter and smoke adapter |
+| `collectors.py` | Tavily discovery/extraction and request caching |
+| `pipeline.py` | Agent-independent orchestration and repair logic |
+| `validation.py` | Deterministic chess and evidence checks |
+| `schema.py`, `storage.py` | Explicit Delta schemas, merges and views |
+| `cli.py` | Installed Databricks wheel entry points |
+| `resources/research_job.yml` | Four-task serverless job |
+| `.github/workflows/databricks.yml` | Public-repository CI and develop deployment |
+| `tests/` | Identity, evidence, replay, failure recovery and deployment checks |
+
+The original root-level scripts and notebook remain as the legacy report tool;
+they are not imported by the deployed wheel. See [legacy usage](docs/legacy-reports.md).
+
+## Tables and publication
+
+All tables and views use one schema, `openings_research`:
+
+| Tables | Grain / purpose |
+| --- | --- |
+| `research_runs`, `research_tasks` | Run configuration and stage status |
+| `raw_responses` | Cached provider response per request per run |
+| `sources`, `source_versions`, `run_sources` | URL identity, captured text and run membership |
+| `agent_outputs` | Original structured response, parsed output and token usage |
+| `candidate_records`, `validation_results` | Proposed records and mechanical checks |
+| `openings` | Requested opening identity, normalized by trimmed case-folded name |
+| `positions`, `position_moves` | Canonical chess graph |
+| `lines`, `opening_lines` | Ordered UCI sequences and named opening associations |
+| `claims`, `claim_evidence` | Assertions and source evidence (also used for line candidates) |
+
+Use `current_claims` and `current_lines`, which join `latest_completed_runs`.
+Each completed run is a replacement snapshot for that requested opening, not an
+incremental union of every historical claim. Compare runs before treating a new
+agent as an improvement. Accepted here means mechanically valid; every published
+claim and line association has `review_status = 'unreviewed'`.
+
+Publication writes all entity tables before marking the run completed. Delta
+transactions are table-scoped; the completed-run view is the publication boundary.
+Direct reads of base tables can include partial/unpublished records. An interrupted
+publish can be repaired without duplicate keys. No valid candidates means a failed
+run, leaving the previous completed run current. Some rejected candidates do not
+prevent publishing valid ones; inspect `validation_results` for partial coverage.
+
+Only this job should write these tables. It allows one concurrent run. Do not
+deploy another writer into the same schema. Schema changes require explicit
+migrations; `CREATE TABLE IF NOT EXISTS` does not migrate existing tables.
+
+## Databricks setup
+
+Requires Unity Catalog, serverless jobs, outbound access to PyPI/Tavily/OpenAI,
+and a deployment/job identity with schema, volume and table privileges.
+
+1. Authenticate: `databricks auth login --host https://YOUR_WORKSPACE`.
+2. Bootstrap the artifact volume before deployment (wheel upload precedes tasks):
+
+   ```sh
+   databricks schemas create openings_research brikt
+   databricks volumes create brikt openings_research artifacts MANAGED
+   ```
+
+3. Store API keys using the interactive prompts; never put them in Git or job parameters:
+
+   ```sh
+   databricks secrets create-scope openings_research
+   databricks secrets put-secret openings_research tavily-api-key
+   databricks secrets put-secret openings_research openai-api-key
+   ```
+
+4. Install/build and deploy:
+
+   ```sh
+   python -m pip install -r requirements-dev.txt
+   databricks bundle validate -t dev
+   databricks bundle deploy -t dev
+   ```
+
+The bundle uploads a versioned wheel under the schema's `artifacts` volume,
+following the neighboring Lichess project. There is no automatic research schedule.
+Deploying creates/updates the job; it does not start paid API research.
+
+## Run and rerun
+
+Credential-free smoke run (writes a separate `__smoke_italian__` opening):
+
+```sh
+databricks bundle run -t dev openings_research --params 'agent=fixture,opening=__smoke_italian__'
 ```
 
-**Research a single opening:**
-```bash
-python main.py --opening "Sicilian Defense"
+Collect new web sources and research an opening:
+
+```sh
+databricks bundle run -t dev openings_research --params 'opening=Italian Game'
 ```
 
-**All options:**
-```
---opening NAME          Research a single opening by name
---openings-file PATH    JSON file with a list of opening names (default: openings.json)
---data-dir PATH         Output directory for JSON reports (default: ./data)
---request-delay SECS    Delay between requests in seconds (default: 1.0)
---log-level LEVEL       DEBUG | INFO | WARNING | ERROR (default: INFO)
+Use the original Databricks job run ID to extract again from saved sources:
+
+```sh
+databricks bundle run -t dev openings_research --params 'opening=Italian Game,mode=reextract,source_run_id=123456,model=gpt-4.1-mini'
 ```
 
-## Output
+Choose a different supported model to compare it; a new run ID preserves both
+results. Source reuse requires the same requested opening identity and a completed
+collection stage. It does not require the original extraction to have succeeded.
+Use Databricks **Repair run** for unchanged failed tasks. Changing agent/model,
+prompt or code configuration requires a new run instead of repairing the old one.
 
-Each opening is saved as `<slug>.json` in `--data-dir`. A `_manifest.json` summary is written after a batch run.
+Requests are cached after their responses are committed. An interruption between
+a remote API response and the cache write can repeat that paid request. Collection
+is bounded to three searches and one batch extract per fresh run; extraction uses
+one model call capped at 8,000 output tokens (provider/task retries can add calls).
+There is no dollar-budget enforcement yet. Token usage is recorded when returned.
 
-```json
-{
-  "opening": "Ruy Lopez (Spanish Opening)",
-  "eco_code": "C60",
-  "moves": "1. e4 e5 2. Nf3 Nc6 3. Bb5",
-  "summary": "...",
-  "ideas": ["..."],
-  "white_plans": ["..."],
-  "black_plans": ["..."],
-  "common_mistakes": ["..."],
-  "pawn_structures": ["..."],
-  "study_advice": ["..."],
-  "notable_players": ["Magnus Carlsen", "Bobby Fischer", "..."],
-  "variations": [
-    { "name": "Berlin Defense", "eco": "C65", "moves": "1. e4 e5 2. Nf3 Nc6 3. Bb5 Nf6" },
-    { "name": "Morphy Defense", "eco": "C78", "moves": "..." }
-  ],
-  "article_links": [
-    { "title": "Ruy Lopez Guide", "url": "https://...", "description": "..." }
-  ],
-  "famous_games": [
-    {
-      "white": "Fischer, R", "white_rating": 2785,
-      "black": "Spassky, B", "black_rating": 2660,
-      "year": 1972, "result": "1-0",
-      "lichess_url": "https://lichess.org/...",
-      "pgn": "[Event ...] 1. e4 e5 ..."
-    }
-  ],
-  "explorer_stats": {
-    "white_wins_pct": 35.2,
-    "draws_pct": 37.1,
-    "black_wins_pct": 27.7,
-    "total_games": 198432
-  },
-  "_meta": { "opening": "Ruy Lopez", "slug": "ruy_lopez" }
-}
+## GitHub deployment
+
+PRs and pushes to `main`/`develop` run lint, tests and wheel builds. Successful
+pushes to **`develop`** deploy the dev bundle. Main currently runs checks only.
+PR jobs cannot access deployment secrets. Actions are pinned to commit SHAs.
+
+Configure the `databricks-dev` GitHub environment, restricted to `develop`, with:
+
+- Variable `DATABRICKS_HOST` (workspace URL).
+- Variable `DATABRICKS_DEPLOY_USER` (the identity owning this dev deployment).
+- Secret `DATABRICKS_TOKEN` (dedicated deployment PAT; rotate before expiration).
+
+The workflow checks deployment identity, serializes deployments, uses bundle
+locking, and refuses deployment during an active job. Git commit SHA is recorded
+as `code_version`. Model API keys stay in Databricks Secrets, not GitHub.
+
+The initial workspace schema, artifact volume, API secret scope and GitHub
+environment were provisioned on October 3, 2026. The dedicated deployment token
+expires January 1, 2027 at 20:08 UTC; rotate the GitHub environment secret before
+then. No token values are stored in this repository.
+
+## Position identity / games integration
+
+`position_id` is SHA-256 over a canonical JSON encoding of the identity version
+and normalized FEN. Normalized FEN includes piece placement, side to move,
+castling rights and **legally available** en passant; move counters are excluded.
+The current identity version is `standard-legal-ep-v1`. Only standard chess is
+supported. Lines preserve ordered UCI moves separately, so transpositions share
+positions without collapsing distinct move orders. Full game history is still
+needed for repetition and fifty-move-rule state.
+
+Use the same `position_record()` function when deriving position IDs from the
+Lichess games' FENs. This project does not modify or reingest that dataset.
+
+## Adding an agent
+
+Implement `ResearchAgent.extract(ResearchInput) -> Extraction` and register it in
+`make_agent()` and the CLI's agent choices. Return `AgentOutput` candidates with
+source-version IDs and exact excerpts. Adapters must not write core tables.
+Agent configuration, contract/prompt/validator versions and code SHA are recorded
+with each run. To add another source type, implement the collector's `collect()`
+interface and retain source snapshots. Keep API calls on the driver, outside Spark
+UDFs, so Spark task retries cannot silently multiply provider requests.
+
+## Tests and next steps
+
+```sh
+python -m ruff check src tests
+python -m pytest -q
+python -m build --wheel
 ```
 
-### Data sources
+Local tests use an in-memory store to exercise orchestration; a deployed fixture
+run verifies actual Spark/Delta execution, permissions and wheel installation.
+Live Tavily/OpenAI research additionally requires working provider credentials.
 
-| Field | Source |
-|---|---|
-| `eco_code`, `moves` | Lichess ECO database (ground truth), LLM fallback |
-| `variations` | Lichess ECO database |
-| `explorer_stats` | Lichess Masters Opening Explorer |
-| `famous_games` + `pgn` | Lichess Masters Explorer + game export API |
-| `article_links` | Tavily web search results |
-| All text fields | OpenAI structured output (GPT-4.1-mini) |
+This is the first usable foundation. Explicit opening aliases/ECO imports,
+structured-dataset collectors, semantic evidence review, engine analysis,
+coverage-driven task planning, report generation and run-comparison UI remain
+future work. Existing knowledge is represented in the agent contract but is not
+yet populated automatically. No claims of comprehensive opening coverage are made.
 
-## HTML Reports
-
-Render any opening JSON as a self-contained HTML page:
-
-```bash
-python render_html.py data/ruy_lopez.json
-# → data/ruy_lopez.html
-
-python render_html.py data/ruy_lopez.json -o reports/ruy_lopez.html
-```
-
-The HTML report includes all fields in a structured layout:
-- ECO code, main-line moves, and summary in a dark header
-- Masters database win/draw/loss bars (from Lichess explorer)
-- Notable players as tags
-- Side-by-side cards: White plans vs Black plans, Key ideas vs Common mistakes, Pawn structures vs Study advice
-- Variations table (ECO code, name, full move sequence)
-- Famous games with expandable PGN and Lichess links
-- Article links with descriptions
-
-No external dependencies — the HTML file is fully self-contained.
-
-## File Structure
-
-```
-├── main.py          # CLI entry point
-├── agent.py         # Orchestration: Lichess + web search + LLM synthesis
-├── lichess.py       # ECO database, Opening Explorer, game PGN fetching
-├── search.py        # Tavily web search (returns content + article refs)
-├── models.py        # Pydantic schemas for OpenAI structured outputs
-├── render_html.py   # Renders a JSON report as a self-contained HTML page
-└── openings.json    # List of opening names to research
-```
+References: [Databricks wheel bundles](https://docs.databricks.com/aws/en/dev-tools/bundles/python-wheel),
+[Delta merge](https://docs.databricks.com/aws/en/delta/merge),
+[OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs),
+[Tavily Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract).

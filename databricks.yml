@@ -1,0 +1,55 @@
+bundle:
+  name: openings-researcher
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Existing Unity Catalog catalog
+    default: brikt
+  schema:
+    default: openings_research
+  volume:
+    default: artifacts
+  secret_scope:
+    default: openings_research
+  code_version:
+    description: Git commit recorded with every research run
+    default: local
+
+workspace:
+  artifact_path: /Volumes/${var.catalog}/${var.schema}/${var.volume}/${bundle.name}/${bundle.target}/${workspace.current_user.short_name}
+
+artifacts:
+  pipeline:
+    type: whl
+    path: .
+    build: python -m build --wheel
+    dynamic_version: true
+
+sync:
+  # Jobs install the wheel. No source, notebooks, local data or credentials need syncing.
+  exclude:
+    - .env
+    - .env.*
+    - .venv/**
+    - .github/**
+    - tests/**
+    - test_data/**
+    - data/**
+    - '*.ipynb'
+    - '**/__pycache__/**'
+    - '**/*.pyc'
+    - dist/**
+    - build/**
+    - src/*.egg-info/**
+
+targets:
+  dev:
+    default: true
+    mode: development
+    bundle:
+      deployment:
+        lock:
+          enabled: true

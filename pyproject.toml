@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openings-researcher"
+version = "0.2.0"
+description = "Replayable chess opening research on Databricks Delta"
+requires-python = ">=3.11"
+dependencies = ["chess==1.11.2", "pydantic>=2.10,<3", "openai==2.32.0", "tavily-python==0.7.23"]
+
+[project.scripts]
+collect = "openings_research.cli:collect"
+extract = "openings_research.cli:extract"
+validate = "openings_research.cli:validate"
+publish = "openings_research.cli:publish"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

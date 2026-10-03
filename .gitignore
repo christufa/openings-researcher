@@ -25,3 +25,15 @@ test_openings.json
 # IDE
 .vscode/
 .idea/
+
+# Credentials, generated artifacts and local deployment state
+.env.*
+!.env.example
+.databricks/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+*.pem
+*.key
