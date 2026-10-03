@@ -23,17 +23,27 @@ resources:
           python_wheel_task:
             package_name: openings_researcher
             entry_point: collect
-            named_parameters: &parameters
-              catalog: ${var.catalog}
-              schema: ${var.schema}
-              secret-scope: ${var.secret_scope}
-              code-version: ${var.code_version}
-              run-id: '{{job.run_id}}'
-              opening: '{{job.parameters.opening}}'
-              mode: '{{job.parameters.mode}}'
-              source-run-id: '{{job.parameters.source_run_id}}'
-              agent: '{{job.parameters.agent}}'
-              model: '{{job.parameters.model}}'
+            parameters: &parameters
+              - --catalog
+              - ${var.catalog}
+              - --schema
+              - ${var.schema}
+              - --secret-scope
+              - ${var.secret_scope}
+              - --code-version
+              - ${var.code_version}
+              - --run-id
+              - '{{job.run_id}}'
+              - --opening
+              - '{{job.parameters.opening}}'
+              - --mode
+              - '{{job.parameters.mode}}'
+              - --source-run-id
+              - '{{job.parameters.source_run_id}}'
+              - --agent
+              - '{{job.parameters.agent}}'
+              - --model
+              - '{{job.parameters.model}}'
         - task_key: extract
           depends_on:
             - task_key: collect
@@ -43,7 +53,7 @@ resources:
           python_wheel_task:
             package_name: openings_researcher
             entry_point: extract
-            named_parameters: *parameters
+            parameters: *parameters
         - task_key: validate
           depends_on:
             - task_key: extract
@@ -53,7 +63,7 @@ resources:
           python_wheel_task:
             package_name: openings_researcher
             entry_point: validate
-            named_parameters: *parameters
+            parameters: *parameters
         - task_key: publish
           depends_on:
             - task_key: validate
@@ -63,7 +73,7 @@ resources:
           python_wheel_task:
             package_name: openings_researcher
             entry_point: publish
-            named_parameters: *parameters
+            parameters: *parameters
       environments:
         - environment_key: research
           spec:
