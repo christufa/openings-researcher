@@ -14,10 +14,15 @@ from .contracts import (
     Source,
     stable_id,
 )
+from .evidence import EVIDENCE_INDEX_VERSION
 from .validation import validate_candidate
 
 STAGES = ["collect", "extract", "validate", "publish"]
 VALIDATOR_VERSION = "legal-moves-exact-evidence-v1"
+
+
+class NoValidCandidatesError(ValueError):
+    """Nothing can be published; inspect persisted validation results."""
 
 
 def now() -> str:
@@ -180,6 +185,18 @@ class Pipeline:
         if not candidates:
             raise ValueError("Agent returned no candidates; inspect unresolved questions")
         self.store.upsert("candidate_records", candidates)
+        print(
+            json.dumps(
+                {
+                    "event": "extraction_summary",
+                    "run_id": self.run_id,
+                    "lines": len(output.lines),
+                    "claims": len(output.claims),
+                    "unresolved_questions": len(output.unresolved_questions),
+                }
+            ),
+            flush=True,
+        )
 
     def sources(self) -> list[Source]:
         return [Source.model_validate(s) for s in self.store.sources_for_run(self.run_id)]
@@ -205,6 +222,18 @@ class Pipeline:
                 result["reason"] = str(exc)[:1000]
             results.append(result)
         self.store.upsert("validation_results", results)
+        valid = sum(r["valid"] for r in results)
+        print(
+            json.dumps(
+                {
+                    "event": "validation_summary",
+                    "run_id": self.run_id,
+                    "valid": valid,
+                    "rejected": len(results) - valid,
+                }
+            ),
+            flush=True,
+        )
 
     def publish(self):
         candidates = {r["candidate_id"]: r for r in self.store.read("candidate_records", run_id=self.run_id)}
@@ -213,7 +242,9 @@ class Pipeline:
             raise ValueError("Validation does not cover the entire candidate batch")
         accepted = [r for r in results if r["valid"]]
         if not accepted:
-            raise ValueError("No mechanically valid candidates; previous published run remains current")
+            raise NoValidCandidatesError(
+                "No mechanically valid candidates; previous published run remains current"
+            )
         self.store.upsert("openings", [{"opening_id": self.opening_id, "name": self.config["opening"]}])
         batches = {
             name: []
@@ -285,5 +316,6 @@ def provenance_config(**kwargs) -> dict:
         "contract_version": CONTRACT_VERSION,
         "prompt_version": PROMPT_VERSION,
         "prompt_hash": stable_id(SYSTEM_PROMPT),
+        "evidence_index_version": EVIDENCE_INDEX_VERSION,
         "validator_version": VALIDATOR_VERSION,
     }

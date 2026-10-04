@@ -13,7 +13,7 @@ from openings_research.contracts import (
     Source,
     position_record,
 )
-from openings_research.pipeline import STAGES, Pipeline, provenance_config
+from openings_research.pipeline import STAGES, NoValidCandidatesError, Pipeline, provenance_config
 from openings_research.schema import KEYS
 from openings_research.validation import validate_candidate
 
@@ -220,3 +220,25 @@ def test_invalid_candidates_are_retained_but_not_published():
     assert len(store.read("validation_results", valid=False)) == 1
     assert not store.read("lines")
     assert len(store.read("claims")) == 1
+
+
+def test_all_rejected_batch_reports_counts_and_cannot_publish(capsys):
+    class ParaphrasingAgent(FixtureAgent):
+        def extract(self, request):
+            result = super().extract(request)
+            for candidate in result.output.lines + result.output.claims:
+                candidate.evidence[0].excerpt = "A paraphrase, not an exact passage."
+            return result
+
+    store = MemoryStore()
+    pipeline = Pipeline(store, "rejected", config())
+    for stage in STAGES[:-1]:
+        pipeline.execute(stage, collector=FixtureCollector(), agent=ParaphrasingAgent())
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[-1] == {"event": "validation_summary", "run_id": "rejected", "valid": 0, "rejected": 2}
+    with pytest.raises(NoValidCandidatesError):
+        pipeline.execute("publish")
+    assert not store.read("claims")
+    assert not store.read("opening_lines")
+    assert len(store.read("candidate_records")) == 2
+    assert store.read("research_tasks", stage="publish")[0]["error_type"] == "NoValidCandidatesError"

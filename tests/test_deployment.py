@@ -16,9 +16,7 @@ def test_job_tasks_share_configuration_and_require_prior_stage():
     assert "schedule" not in job
     tasks = job["tasks"]
     for index, task in enumerate(tasks):
-        assert (
-            task["python_wheel_task"]["parameters"] == tasks[0]["python_wheel_task"]["parameters"]
-        )
+        assert task["python_wheel_task"]["parameters"] == tasks[0]["python_wheel_task"]["parameters"]
         if index:
             assert task["depends_on"] == [{"task_key": tasks[index - 1]["task_key"]}]
 

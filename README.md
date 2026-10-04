@@ -20,6 +20,8 @@ Tavily or saved sources -> collect -> extract -> validate -> publish
   excerpt, while the raw response retains the full returned text.
 - An OpenAI structured-output adapter (configurable model, default `gpt-4.1-mini`)
   extracts move sequences, plans, pawn breaks, maneuvers, tactics and assessments.
+  It selects numbered source passages; the pipeline copies their original text
+  into evidence records. The model does not generate evidence quotations.
 - A credential-free fixture adapter exercises the same contracts and tables.
 - Legal-move, FEN, source-reference and exact-excerpt validation. Rejected
   candidates remain inspectable; prose semantics are **unreviewed**, not verified.
@@ -33,6 +35,7 @@ Tavily or saved sources -> collect -> extract -> validate -> publish
 | --- | --- |
 | `src/openings_research/contracts.py` | Versioned Pydantic input/output and position identity |
 | `agents.py` | Agent protocol, OpenAI adapter and smoke adapter |
+| `evidence.py` | Deterministic passage catalog and source-reference resolution |
 | `collectors.py` | Tavily discovery/extraction and request caching |
 | `pipeline.py` | Agent-independent orchestration and repair logic |
 | `validation.py` | Deterministic chess and evidence checks |
@@ -186,6 +189,28 @@ Agent configuration, contract/prompt/validator versions and code SHA are recorde
 with each run. To add another source type, implement the collector's `collect()`
 interface and retain source snapshots. Keep API calls on the driver, outside Spark
 UDFs, so Spark task retries cannot silently multiply provider requests.
+
+The OpenAI adapter uses an internal reference schema whose allowed passage IDs
+are enumerated for each request. It divides source text into chunks of at most
+1,200 characters, preferring paragraph/newline boundaries, and preserves Markdown,
+Unicode punctuation and whitespace exactly. Source order is deterministic. A
+request with more than 500 passages fails explicitly and must be split rather
+than silently losing coverage. Blank sources are ignored.
+
+The adapter resolves passage IDs to the existing `AgentOutput` evidence format;
+the public contract and Delta table schemas are unchanged. `agent_outputs.raw_response`
+now contains a JSON envelope with the original provider response, the evidence-index
+version, and passage-to-source offsets (Unicode character offsets, end exclusive).
+Old runs retain their original response format. Unknown references fail closed.
+The validator still checks exact source membership and legal moves. A matching
+passage is traceable evidence, not proof that it supports every assertion; semantic
+review remains separate and published records remain `unreviewed`.
+
+Task output includes `extraction_summary` and `validation_summary` with candidate
+and rejection counts. An all-rejected batch fails publication with
+`NoValidCandidatesError`. To retry a failed extraction with the updated prompt,
+start a **new reextract run** pointing at the original source run; do not repair
+the old run with a changed code/prompt configuration.
 
 ## Tests and next steps
 
