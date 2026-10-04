@@ -7,7 +7,9 @@ from typing import Literal
 import chess
 from pydantic import BaseModel, ConfigDict, Field
 
-CONTRACT_VERSION = "1"
+from .taxonomy import ClaimCategory
+
+CONTRACT_VERSION = "2"
 POSITION_VERSION = "standard-legal-ep-v1"
 
 
@@ -42,7 +44,7 @@ class LineCandidate(Contract):
 
 class ClaimCandidate(Contract):
     text: str = Field(min_length=1)
-    category: Literal["plan", "pawn_break", "maneuver", "tactic", "mistake", "move_order", "assessment"]
+    category: ClaimCategory
     side: Literal["white", "black", "both"]
     position_fen: str | None
     evidence: list[Evidence] = Field(min_length=1)
@@ -58,6 +60,7 @@ class ResearchInput(Contract):
     opening: str
     sources: list[Source]
     existing_claims: list[str] = Field(default_factory=list)
+    coverage_gaps: list[str] = Field(default_factory=list)
 
 
 def position_record(board: chess.Board) -> dict:

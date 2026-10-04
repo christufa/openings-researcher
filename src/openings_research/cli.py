@@ -7,6 +7,7 @@ import os
 from .agents import make_agent
 from .collectors import FixtureCollector, TavilyCollector
 from .pipeline import Pipeline, provenance_config
+from .review import make_reviewer
 from .storage import DeltaStore
 
 
@@ -20,6 +21,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--source-run-id", default="")
     result.add_argument("--agent", choices=["openai", "fixture"], default="openai")
     result.add_argument("--model", default="gpt-4.1-mini")
+    result.add_argument("--review-model", default="gpt-4.1-mini")
     result.add_argument("--secret-scope", default="openings_research")
     result.add_argument("--code-version", default="local")
     return result
@@ -42,6 +44,7 @@ def run(stage: str):
         source_run_id=args.source_run_id,
         agent=args.agent,
         model=args.model,
+        review_model=args.review_model,
         code_version=args.code_version,
     )
     pipeline = Pipeline(store, args.run_id, config)
@@ -73,10 +76,18 @@ def run(stage: str):
                 secret("openai-api-key", "OPENAI_API_KEY") if args.agent == "openai" else "",
             ).extract(request)
 
+    class LazyReviewer:
+        def review(self, opening, candidates, source_urls):
+            return make_reviewer(
+                args.agent,
+                args.review_model,
+                secret("openai-api-key", "OPENAI_API_KEY") if args.agent == "openai" else "",
+            ).review(opening, candidates, source_urls)
+
     collector, agent = LazyCollector(), LazyAgent()
     print(json.dumps({"event": "stage_started", "stage": stage, "run_id": args.run_id}), flush=True)
     try:
-        pipeline.execute(stage, collector=collector, agent=agent)
+        pipeline.execute(stage, collector=collector, agent=agent, reviewer=LazyReviewer())
     except Exception as exc:
         # Provider exception text may contain request data; emit only the type.
         print(
@@ -110,3 +121,7 @@ def validate():
 
 def publish():
     run("publish")
+
+
+def review():
+    run("review")

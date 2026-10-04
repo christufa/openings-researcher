@@ -31,7 +31,12 @@ class DeltaStore:
                 PARTITION BY opening_id ORDER BY completed_at DESC, run_id DESC
               ) rn FROM {self.table("research_runs")} WHERE status = 'completed'
             ) WHERE rn = 1""")
-        for table, view in [("claims", "current_claims"), ("opening_lines", "current_lines")]:
+        for table, view in [
+            ("claims", "current_claims"),
+            ("opening_lines", "current_lines"),
+            ("coverage_reports", "current_coverage"),
+            ("research_gaps", "current_research_gaps"),
+        ]:
             self.spark.sql(f"""CREATE OR REPLACE VIEW {self.namespace}.{view} AS
                 SELECT data.* FROM {self.table(table)} data
                 JOIN {self.namespace}.latest_completed_runs runs ON data.run_id = runs.run_id""")

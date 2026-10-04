@@ -1,6 +1,7 @@
-"""Durable four-stage pipeline. Agents and collectors are replaceable boundaries."""
+"""Durable five-stage pipeline. Agents and collectors are replaceable boundaries."""
 
 import json
+from collections import Counter
 from datetime import datetime, timezone
 
 from . import __version__
@@ -14,10 +15,13 @@ from .contracts import (
     Source,
     stable_id,
 )
+from .coverage import COVERAGE_VERSION, coverage_report, gap_records
 from .evidence import EVIDENCE_INDEX_VERSION
+from .review import REVIEW_PROMPT, REVIEW_VERSION, ReviewOutput, validate_reviews
+from .taxonomy import TAXONOMY_VERSION
 from .validation import validate_candidate
 
-STAGES = ["collect", "extract", "validate", "publish"]
+STAGES = ["collect", "extract", "validate", "review", "publish"]
 VALIDATOR_VERSION = "legal-moves-exact-evidence-v1"
 
 
@@ -36,7 +40,7 @@ class Pipeline:
         self.config = config
         self.opening_id = stable_id("opening-name-v1", config["opening"].strip().casefold())
 
-    def execute(self, stage: str, collector=None, agent=None):
+    def execute(self, stage: str, collector=None, agent=None, reviewer=None):
         if stage not in STAGES:
             raise ValueError("Unknown stage")
         config_json = json.dumps(self.config, sort_keys=True)
@@ -84,6 +88,8 @@ class Pipeline:
                 self.extract(agent)
             elif stage == "validate":
                 self.validate()
+            elif stage == "review":
+                self.review(reviewer)
             else:
                 self.publish()
             if stage == "publish":
@@ -155,7 +161,16 @@ class Pipeline:
         if cached:
             output = AgentOutput.model_validate_json(cached[0]["output_json"])
         else:
-            request = ResearchInput(opening=self.config["opening"], sources=self.sources())
+            prior_id = self.config.get("source_run_id")
+            previous = self.store.read("claims", run_id=prior_id) if prior_id else []
+            reports = self.store.read("coverage_reports", run_id=prior_id) if prior_id else []
+            gaps = json.loads(reports[0]["report_json"])["gaps"] if reports else []
+            request = ResearchInput(
+                opening=self.config["opening"],
+                sources=self.sources(),
+                existing_claims=[c["text"] for c in previous],
+                coverage_gaps=[f"{g['side']} {g['topic']}: {g['reason']}" for g in gaps],
+            )
             result = agent.extract(request)
             output = AgentOutput.model_validate(result.output)
             self.store.upsert(
@@ -235,15 +250,74 @@ class Pipeline:
             flush=True,
         )
 
+    def review(self, reviewer):
+        valid = {
+            r["candidate_id"] for r in self.store.read("validation_results", run_id=self.run_id) if r["valid"]
+        }
+        candidates = [
+            c for c in self.store.read("candidate_records", run_id=self.run_id) if c["candidate_id"] in valid
+        ]
+        cached = self.store.read("review_outputs", run_id=self.run_id)
+        if cached:
+            output = ReviewOutput.model_validate_json(cached[0]["output_json"])
+        elif candidates:
+            result = reviewer.review(
+                self.config["opening"], candidates, {s.source_version_id: s.url for s in self.sources()}
+            )
+            output = ReviewOutput.model_validate(result.output)
+            self.store.upsert(
+                "review_outputs",
+                [
+                    {
+                        "run_id": self.run_id,
+                        "output_json": output.model_dump_json(),
+                        "raw_response": result.raw_response,
+                        "usage_json": result.usage_json,
+                        "created_at": now(),
+                    }
+                ],
+            )
+        else:
+            output = ReviewOutput(reviews=[])
+        validate_reviews(output, candidates)
+        self.store.upsert(
+            "candidate_reviews",
+            [
+                {**r.model_dump(), "run_id": self.run_id, "reviewer_version": REVIEW_VERSION}
+                for r in output.reviews
+            ],
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "review_summary",
+                    "run_id": self.run_id,
+                    "decisions": dict(Counter(r.decision for r in output.reviews)),
+                }
+            ),
+            flush=True,
+        )
+
     def publish(self):
         candidates = {r["candidate_id"]: r for r in self.store.read("candidate_records", run_id=self.run_id)}
         results = self.store.read("validation_results", run_id=self.run_id)
         if set(candidates) != {r["candidate_id"] for r in results}:
             raise ValueError("Validation does not cover the entire candidate batch")
-        accepted = [r for r in results if r["valid"]]
+        valid = [r for r in results if r["valid"]]
+        reviews = self.store.read("candidate_reviews", run_id=self.run_id)
+        output = ReviewOutput.model_validate(
+            {
+                "reviews": [
+                    {k: r[k] for k in ("candidate_id", "decision", "category", "rationale")} for r in reviews
+                ]
+            }
+        )
+        validate_reviews(output, [candidates[r["candidate_id"]] for r in valid])
+        by_id = {r["candidate_id"]: r for r in reviews}
+        accepted = [r for r in valid if by_id[r["candidate_id"]]["decision"] == "accept"]
         if not accepted:
             raise NoValidCandidatesError(
-                "No mechanically valid candidates; previous published run remains current"
+                "No candidates passed validation and review; previous published run remains current"
             )
         self.store.upsert("openings", [{"opening_id": self.opening_id, "name": self.config["opening"]}])
         batches = {
@@ -258,7 +332,9 @@ class Pipeline:
                 "run_id": self.run_id,
                 "opening_id": self.opening_id,
                 "candidate_id": record["candidate_id"],
-                "review_status": "unreviewed",
+                "review_status": "fixture_reviewed"
+                if self.config["agent"] == "fixture"
+                else "model_reviewed",
             }
             if record["kind"] == "line":
                 batches["positions"].extend(normalized["positions"])
@@ -288,10 +364,14 @@ class Pipeline:
                         **common,
                         "record_id": record["candidate_id"],
                         "claim_id": stable_id(
-                            self.opening_id, payload["text"], payload["category"], payload["side"], position
+                            self.opening_id,
+                            payload["text"],
+                            by_id[record["candidate_id"]]["category"],
+                            payload["side"],
+                            position,
                         ),
                         "text": payload["text"],
-                        "category": payload["category"],
+                        "category": by_id[record["candidate_id"]]["category"],
                         "side": payload["side"],
                         "position_id": position["position_id"] if position else None,
                     }
@@ -307,6 +387,39 @@ class Pipeline:
                 )
         for table, rows in batches.items():
             self.store.upsert(table, rows)
+        report = coverage_report(
+            self.config["opening"],
+            batches["claims"],
+            batches["opening_lines"],
+            batches["claim_evidence"],
+            self.sources(),
+            {"valid": len(valid), "rejected": len(results) - len(valid)},
+            dict(Counter(r["decision"] for r in reviews)),
+        )
+        self.store.upsert(
+            "coverage_reports",
+            [
+                {
+                    "run_id": self.run_id,
+                    "opening_id": self.opening_id,
+                    "report_json": json.dumps(report),
+                    "created_at": now(),
+                }
+            ],
+        )
+        self.store.upsert("research_gaps", gap_records(self.run_id, self.opening_id, report))
+        print(
+            json.dumps(
+                {
+                    "event": "coverage_summary",
+                    "run_id": self.run_id,
+                    "published_claims": report["published_claims"],
+                    "published_lines": report["published_lines"],
+                    "gaps": len(report["gaps"]),
+                }
+            ),
+            flush=True,
+        )
 
 
 def provenance_config(**kwargs) -> dict:
@@ -317,5 +430,9 @@ def provenance_config(**kwargs) -> dict:
         "prompt_version": PROMPT_VERSION,
         "prompt_hash": stable_id(SYSTEM_PROMPT),
         "evidence_index_version": EVIDENCE_INDEX_VERSION,
+        "reviewer_version": REVIEW_VERSION,
+        "review_prompt_hash": stable_id(REVIEW_PROMPT),
+        "taxonomy_version": TAXONOMY_VERSION,
+        "coverage_version": COVERAGE_VERSION,
         "validator_version": VALIDATOR_VERSION,
     }

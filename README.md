@@ -6,14 +6,14 @@ Agents produce candidates; the pipeline owns source snapshots, chess validation,
 publication, and run history. Games remain in the separate Lichess pipeline.
 
 ```text
-Tavily or saved sources -> collect -> extract -> validate -> publish
-                                      |            |          |
-                              replaceable agent  checks   Delta views
+Tavily or saved sources -> collect -> extract -> validate -> review -> publish
+                                      |            |         |          |
+                              replaceable agent  checks   support   Delta views
 ```
 
 ## What works
 
-- Four serverless wheel tasks, with retries and durable stage markers.
+- Five serverless wheel tasks, with retries and durable stage markers.
 - Tavily searches across three topics, deduplicates URLs, and extracts up to six
   documents. Raw responses (including extraction failures) are retained. The agent
   sees up to 10,000 characters per document; the saved source version is that exact
@@ -23,8 +23,11 @@ Tavily or saved sources -> collect -> extract -> validate -> publish
   It selects numbered source passages; the pipeline copies their original text
   into evidence records. The model does not generate evidence quotations.
 - A credential-free fixture adapter exercises the same contracts and tables.
-- Legal-move, FEN, source-reference and exact-excerpt validation. Rejected
-  candidates remain inspectable; prose semantics are **unreviewed**, not verified.
+- Legal-move, FEN, source-reference and exact-excerpt validation, followed by a
+  separate model review of source support, line naming and claim categories.
+  Rejected and ambiguous candidates remain inspectable but are not published.
+- Coverage reports across nine topics and both sides, with prioritized gaps and
+  suggested searches. Re-extraction receives the parent run's claims and gaps.
 - Re-extraction using another model against the exact same saved sources.
 - Stable chess entity IDs, idempotent merges, history per run, and current views
   that select only completed publication batches.
@@ -39,9 +42,11 @@ Tavily or saved sources -> collect -> extract -> validate -> publish
 | `collectors.py` | Tavily discovery/extraction and request caching |
 | `pipeline.py` | Agent-independent orchestration and repair logic |
 | `validation.py` | Deterministic chess and evidence checks |
+| `review.py`, `taxonomy.py` | Source-support review and explicit claim categories |
+| `coverage.py` | Topic/side presence and prioritized research gaps |
 | `schema.py`, `storage.py` | Explicit Delta schemas, merges and views |
 | `cli.py` | Installed Databricks wheel entry points |
-| `resources/research_job.yml` | Four-task serverless job |
+| `resources/research_job.yml` | Five-task serverless job |
 | `.github/workflows/databricks.yml` | Public-repository CI and develop deployment |
 | `tests/` | Identity, evidence, replay, failure recovery and deployment checks |
 
@@ -59,6 +64,8 @@ All tables and views use one schema, `openings_research`:
 | `sources`, `source_versions`, `run_sources` | URL identity, captured text and run membership |
 | `agent_outputs` | Original structured response, parsed output and token usage |
 | `candidate_records`, `validation_results` | Proposed records and mechanical checks |
+| `review_outputs`, `candidate_reviews` | Original reviewer response, decisions and rationales |
+| `coverage_reports`, `research_gaps` | Publication coverage and suggested follow-up research |
 | `openings` | Requested opening identity, normalized by trimmed case-folded name |
 | `positions`, `position_moves` | Canonical chess graph |
 | `lines`, `opening_lines` | Ordered UCI sequences and named opening associations |
@@ -67,15 +74,35 @@ All tables and views use one schema, `openings_research`:
 Use `current_claims` and `current_lines`, which join `latest_completed_runs`.
 Each completed run is a replacement snapshot for that requested opening, not an
 incremental union of every historical claim. Compare runs before treating a new
-agent as an improvement. Accepted here means mechanically valid; every published
-claim and line association has `review_status = 'unreviewed'`.
+agent as an improvement. New published records must pass both mechanical validation
+and review. Their status is `model_reviewed` (or `fixture_reviewed` for the authored
+smoke test). A second model pass is not human verification or engine analysis;
+both passes use the same default model unless configured otherwise. Historical
+records retain their original status. Category corrections preserve the original
+candidate and record the reviewer's rationale separately.
+
+`current_coverage` and `current_research_gaps` follow the same completed-run boundary:
+
+```sql
+SELECT topic, side, priority, reason, query
+FROM brikt.openings_research.current_research_gaps
+ORDER BY priority, topic, side;
+
+SELECT report_json FROM brikt.openings_research.current_coverage;
+```
+
+Coverage measures topic presence, not complete opening theory. It reports branch
+completeness and source independence as unassessed. Suggested searches are saved
+for follow-up; they do not automatically start additional paid research.
 
 Publication writes all entity tables before marking the run completed. Delta
 transactions are table-scoped; the completed-run view is the publication boundary.
 Direct reads of base tables can include partial/unpublished records. An interrupted
 publish can be repaired without duplicate keys. No valid candidates means a failed
 run, leaving the previous completed run current. Some rejected candidates do not
-prevent publishing valid ones; inspect `validation_results` for partial coverage.
+prevent publishing accepted ones; inspect `validation_results`, `candidate_reviews`
+and `coverage_reports` for partial coverage. Missing or duplicate review decisions
+block publication. Coverage is persisted before the completed marker as well.
 
 Only this job should write these tables. It allows one concurrent run. Do not
 deploy another writer into the same schema. Schema changes require explicit
@@ -131,19 +158,22 @@ databricks bundle run -t dev openings_research --params 'opening=Italian Game'
 Use the original Databricks job run ID to extract again from saved sources:
 
 ```sh
-databricks bundle run -t dev openings_research --params 'opening=Italian Game,mode=reextract,source_run_id=123456,model=gpt-4.1-mini'
+databricks bundle run -t dev openings_research --params 'opening=Italian Game,mode=reextract,source_run_id=123456,model=gpt-4.1-mini,review_model=gpt-4.1-mini'
 ```
 
 Choose a different supported model to compare it; a new run ID preserves both
 results. Source reuse requires the same requested opening identity and a completed
 collection stage. It does not require the original extraction to have succeeded.
+Published claims and coverage gaps, when available from that source run, are
+passed as research hints, never as substitute source evidence.
 Use Databricks **Repair run** for unchanged failed tasks. Changing agent/model,
 prompt or code configuration requires a new run instead of repairing the old one.
 
 Requests are cached after their responses are committed. An interruption between
 a remote API response and the cache write can repeat that paid request. Collection
 is bounded to three searches and one batch extract per fresh run; extraction uses
-one model call capped at 8,000 output tokens (provider/task retries can add calls).
+one model call and review uses another, each capped at 8,000 output tokens
+(provider/task retries can add calls). Review batches are limited to 100 candidates.
 There is no dollar-budget enforcement yet. Token usage is recorded when returned.
 
 ## GitHub deployment
@@ -198,16 +228,19 @@ request with more than 500 passages fails explicitly and must be split rather
 than silently losing coverage. Blank sources are ignored.
 
 The adapter resolves passage IDs to the existing `AgentOutput` evidence format;
-the public contract and Delta table schemas are unchanged. `agent_outputs.raw_response`
+the evidence contract remains stable. `agent_outputs.raw_response`
 now contains a JSON envelope with the original provider response, the evidence-index
 version, and passage-to-source offsets (Unicode character offsets, end exclusive).
 Old runs retain their original response format. Unknown references fail closed.
 The validator still checks exact source membership and legal moves. A matching
 passage is traceable evidence, not proof that it supports every assertion; semantic
-review remains separate and published records remain `unreviewed`.
+review is a separate required stage before publication. Review responses and exact
+candidate decisions are cached for repair, including malformed review batches
+that fail validation. Use a new run to retry a malformed cached review. Prompt,
+taxonomy, review and coverage versions are included in run provenance.
 
-Task output includes `extraction_summary` and `validation_summary` with candidate
-and rejection counts. An all-rejected batch fails publication with
+Task output includes `extraction_summary`, `validation_summary`, `review_summary`
+and `coverage_summary` with candidate, decision and gap counts. An all-rejected batch fails publication with
 `NoValidCandidatesError`. To retry a failed extraction with the updated prompt,
 start a **new reextract run** pointing at the original source run; do not repair
 the old run with a changed code/prompt configuration.
@@ -224,11 +257,11 @@ Local tests use an in-memory store to exercise orchestration; a deployed fixture
 run verifies actual Spark/Delta execution, permissions and wheel installation.
 Live Tavily/OpenAI research additionally requires working provider credentials.
 
-This is the first usable foundation. Explicit opening aliases/ECO imports,
-structured-dataset collectors, semantic evidence review, engine analysis,
-coverage-driven task planning, report generation and run-comparison UI remain
-future work. Existing knowledge is represented in the agent contract but is not
-yet populated automatically. No claims of comprehensive opening coverage are made.
+Explicit opening aliases/ECO imports, structured-dataset collectors, engine
+analysis, automatic execution of gap searches, report generation and a
+run-comparison UI remain future work. The current release adds four new tables
+without altering existing table schemas. No claims of comprehensive opening
+coverage are made.
 
 References: [Databricks wheel bundles](https://docs.databricks.com/aws/en/dev-tools/bundles/python-wheel),
 [Delta merge](https://docs.databricks.com/aws/en/delta/merge),

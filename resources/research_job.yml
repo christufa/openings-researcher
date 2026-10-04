@@ -15,6 +15,8 @@ resources:
           default: openai
         - name: model
           default: gpt-4.1-mini
+        - name: review_model
+          default: gpt-4.1-mini
       tasks:
         - task_key: collect
           environment_key: research
@@ -44,6 +46,8 @@ resources:
               - '{{job.parameters.agent}}'
               - --model
               - '{{job.parameters.model}}'
+              - --review-model
+              - '{{job.parameters.review_model}}'
         - task_key: extract
           depends_on:
             - task_key: collect
@@ -64,9 +68,19 @@ resources:
             package_name: openings_researcher
             entry_point: validate
             parameters: *parameters
-        - task_key: publish
+        - task_key: review
           depends_on:
             - task_key: validate
+          environment_key: research
+          max_retries: 2
+          min_retry_interval_millis: 60000
+          python_wheel_task:
+            package_name: openings_researcher
+            entry_point: review
+            parameters: *parameters
+        - task_key: publish
+          depends_on:
+            - task_key: review
           environment_key: research
           max_retries: 2
           min_retry_interval_millis: 60000
