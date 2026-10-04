@@ -176,6 +176,38 @@ one model call and review uses another, each capped at 8,000 output tokens
 (provider/task retries can add calls). Review batches are limited to 100 candidates.
 There is no dollar-budget enforcement yet. Token usage is recorded when returned.
 
+## Bounded batches
+
+The supplied `batches/major-openings-20.json` researches 20 opening families once
+each. Submit to the existing deployed job with the authenticated Databricks CLI:
+
+```sh
+python -m openings_research.batch submit --job-id 520751515929653 --openings batches/major-openings-20.json --manifest .databricks/batch-20.json --profile brikt
+python -m openings_research.batch status --manifest .databricks/batch-20.json --profile brikt
+```
+
+Use `--cli /path/to/databricks` when the CLI is not on PATH. The local manifest is
+saved before submission and after each accepted run. To resume an interrupted
+submission, repeat `submit` with the same manifest, omitting `--job-id` and
+`--openings`. Saved idempotency tokens prevent duplicate job launches. Keep the
+manifest; a new manifest intentionally creates a new batch. Do not run concurrent
+submitters against the same manifest.
+
+Each request enables Databricks queueing; the job retains one concurrent run.
+The queue runs in Databricks after this command exits, with no local process or
+automatic research schedule needed. A failed opening does not block later queued
+runs; inspect status and repair failed runs separately. Avoid deploying new code
+while a batch is queued or running. Queue expiration and workspace limits can
+prevent later runs from starting; the status command reports their actual states.
+
+A 20-opening refresh requests 60 advanced searches, up to 120 extracted URLs,
+and normally 40 model calls, before retries. This is a request-count bound, not
+a dollar cap; provider charges and Databricks compute are additional. Results
+replace each opening's current snapshot only after successful publication.
+
+See the [Databricks run-now API](https://docs.databricks.com/api/jobs/v2/run-now)
+for queueing and idempotency behavior.
+
 ## GitHub deployment
 
 PRs and pushes to `main`/`develop` run lint, tests and wheel builds. Successful
